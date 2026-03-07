@@ -59,13 +59,15 @@ namespace rpcs3
 
 	bool is_release_build()
 	{
-		static constexpr bool is_release_build = std::string_view(RPCS3_GIT_FULL_BRANCH) == "RPCS3/rpcs3/master"sv;
-		return is_release_build;
+		// static constexpr bool is_release_build = std::string_view(RPCS3_GIT_FULL_BRANCH) == "RPCS3/rpcs3/master"sv;
+		// return is_release_build;
+    return false;
 	}
 
 	bool is_local_build()
 	{
-		static constexpr bool is_local_build = std::string_view(RPCS3_GIT_FULL_BRANCH) == "local_build"sv;
-		return is_local_build;
+		// static constexpr bool is_local_build = std::string_view(RPCS3_GIT_FULL_BRANCH) == "local_build"sv;
+		// return is_local_build;
+    return true;
 	}
 }
