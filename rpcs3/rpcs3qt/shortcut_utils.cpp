@@ -1,7 +1,12 @@
 #include "stdafx.h"
 #include "shortcut_utils.h"
+#include "steam_utils.h"
 #include "qt_utils.h"
+#include "gui_game_info.h"
+
 #include "Emu/VFS.h"
+#include "Emu/vfs_config.h"
+#include "Emu/system_utils.hpp"
 #include "Utilities/File.h"
 #include "Utilities/StrUtil.h"
 #include "Loader/ISO.h"
@@ -29,6 +34,25 @@
 #include <QStandardPaths>
 
 LOG_CHANNEL(sys_log, "SYS");
+
+template <>
+void fmt_class_string<gui::utils::shortcut_location>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](gui::utils::shortcut_location value)
+	{
+		switch (value)
+		{
+		case gui::utils::shortcut_location::desktop: return "desktop";
+		case gui::utils::shortcut_location::applications: return "applications";
+		case gui::utils::shortcut_location::steam: return "steam";
+#ifdef _WIN32
+		case gui::utils::shortcut_location::rpcs3_shortcuts: return "rpcs3";
+#endif
+		}
+
+		return unknown;
+	});
+}
 
 namespace gui::utils
 {
@@ -88,11 +112,13 @@ namespace gui::utils
 	bool create_shortcut(const std::string& name,
 	                     const std::string& path,
 	    [[maybe_unused]] const std::string& serial,
-	    [[maybe_unused]] const std::string& target_cli_args,
+	                     const std::string& target_cli_args,
 	    [[maybe_unused]] const std::string& description,
-	    [[maybe_unused]] const std::string& src_icon_path,
+	                     const std::string& src_icon_path,
 	    [[maybe_unused]] const std::string& target_icon_dir,
-	    shortcut_location location)
+	                     const std::string& src_banner_path,
+	                     shortcut_location location,
+	                     std::shared_ptr<iso_archive> archive)
 	{
 		if (name.empty())
 		{
@@ -109,6 +135,7 @@ namespace gui::utils
 		}
 
 		std::string link_path;
+		bool append_rpcs3 = false;
 
 		switch (location)
 		{
@@ -117,6 +144,13 @@ namespace gui::utils
 			break;
 		case shortcut_location::applications:
 			link_path = QStandardPaths::writableLocation(QStandardPaths::StandardLocation::ApplicationsLocation).toStdString();
+			append_rpcs3 = true;
+			break;
+		case shortcut_location::steam:
+#ifdef __APPLE__
+			link_path = QStandardPaths::writableLocation(QStandardPaths::StandardLocation::ApplicationsLocation).toStdString();
+			append_rpcs3 = true;
+#endif
 			break;
 #ifdef _WIN32
 		case shortcut_location::rpcs3_shortcuts:
@@ -126,13 +160,13 @@ namespace gui::utils
 #endif
 		}
 
-		if (!fs::is_dir(link_path) && !fs::create_dir(link_path))
+		if (!link_path.empty() && !fs::is_dir(link_path) && !fs::create_dir(link_path))
 		{
 			sys_log.error("Failed to create shortcut. Folder does not exist: %s", link_path);
 			return false;
 		}
 
-		if (location == shortcut_location::applications)
+		if (append_rpcs3)
 		{
 			link_path += "/RPCS3";
 
@@ -144,6 +178,29 @@ namespace gui::utils
 		}
 
 #ifdef _WIN32
+		const std::string working_dir{fs::get_executable_dir()};
+		const std::string rpcs3_path{fs::get_executable_path()};
+		std::string target_icon_path;
+
+		if (!src_icon_path.empty() && !target_icon_dir.empty())
+		{
+			if (!create_square_shortcut_icon_file(path, src_icon_path, target_icon_dir, target_icon_path, 512))
+			{
+				sys_log.error("Failed to create shortcut: .ico creation failed");
+				return false;
+			}
+		}
+
+		if (location == shortcut_location::steam)
+		{
+			sys_log.notice("Creating %s shortcut with arguments '%s'", location, target_cli_args);
+			steam_shortcut steam_sc{};
+			steam_sc.add_shortcut(simple_name, rpcs3_path, working_dir, target_cli_args, target_icon_path, src_icon_path, src_banner_path, archive);
+			return steam_sc.write_file();
+		}
+
+		sys_log.notice("Creating %s shortcut '%s' with arguments '%s' and .ico dir '%s'", location, link_path, target_cli_args, target_icon_dir);
+
 		const auto str_error = [](HRESULT hr) -> std::string
 		{
 			_com_error err(hr);
@@ -152,8 +209,6 @@ namespace gui::utils
 		};
 
 		fmt::append(link_path, "/%s.lnk", simple_name);
-
-		sys_log.notice("Creating shortcut '%s' with arguments '%s' and .ico dir '%s'", link_path, target_cli_args, target_icon_dir);
 
 		// https://stackoverflow.com/questions/3906974/how-to-programmatically-create-a-shortcut-using-win32
 		HRESULT res = CoInitialize(NULL);
@@ -176,9 +231,6 @@ namespace gui::utils
 		res = CoCreateInstance(__uuidof(ShellLink), NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pShellLink));
 		if (FAILED(res))
 			return cleanup(false, "CoCreateInstance failed");
-
-		const std::string working_dir{ fs::get_executable_dir() };
-		const std::string rpcs3_path{ working_dir + "rpcs3.exe" };
 
 		const std::wstring w_target_file = utf8_to_wchar(rpcs3_path);
 		res = pShellLink->SetPath(w_target_file.c_str());
@@ -206,12 +258,8 @@ namespace gui::utils
 				return cleanup(false, fmt::format("SetDescription failed (%s)", str_error(res)));
 		}
 
-		if (!src_icon_path.empty() && !target_icon_dir.empty())
+		if (!target_icon_path.empty())
 		{
-			std::string target_icon_path;
-			if (!create_square_shortcut_icon_file(path, src_icon_path, target_icon_dir, target_icon_path, 512))
-				return cleanup(false, ".ico creation failed");
-
 			const std::wstring w_icon_path = utf8_to_wchar(target_icon_path);
 			res = pShellLink->SetIconLocation(w_icon_path.c_str(), 0);
 			if (FAILED(res))
@@ -241,9 +289,10 @@ namespace gui::utils
 		return cleanup(true, {});
 
 #elif defined(__APPLE__)
+
 		fmt::append(link_path, "/%s.app", simple_name);
 
-		sys_log.notice("Creating shortcut '%s' with arguments '%s'", link_path, target_cli_args);
+		sys_log.notice("Creating %s shortcut '%s' with arguments '%s'", location, link_path, target_cli_args);
 
 		const std::string contents_dir = link_path + "/Contents/";
 		const std::string macos_dir = contents_dir + "MacOS/";
@@ -330,10 +379,16 @@ namespace gui::utils
 			}
 		}
 
+		if (location == shortcut_location::steam)
+		{
+			steam_shortcut steam_sc{};
+			steam_sc.add_shortcut(simple_name, link_path, macos_dir, ""/*target_cli_args are already in the launcher*/, "", src_icon_path, src_banner_path, archive);
+			return steam_sc.write_file();
+		}
+
 		return true;
 
 #else
-
 		const std::string exe_path = fs::get_executable_path();
 		if (exe_path.empty())
 		{
@@ -341,9 +396,28 @@ namespace gui::utils
 			return false;
 		}
 
+		std::string target_icon_path;
+		if (!src_icon_path.empty() && !target_icon_dir.empty())
+		{
+			if (!create_square_shortcut_icon_file(path, src_icon_path, target_icon_dir, target_icon_path, 512))
+			{
+				// Error is logged in create_square_shortcut_icon_file
+				return false;
+			}
+		}
+
+		if (location == shortcut_location::steam)
+		{
+			sys_log.notice("Creating %s shortcut with arguments '%s'", location, target_cli_args);
+			const std::string working_dir{fs::get_executable_dir()};
+			steam_shortcut steam_sc{};
+			steam_sc.add_shortcut(simple_name, exe_path, working_dir, target_cli_args, target_icon_path, src_icon_path, src_banner_path, archive);
+			return steam_sc.write_file();
+		}
+
 		fmt::append(link_path, "/%s.desktop", simple_name);
 
-		sys_log.notice("Creating shortcut '%s' for '%s' with arguments '%s'", link_path, exe_path, target_cli_args);
+		sys_log.notice("Creating %s shortcut '%s' for '%s' with arguments '%s'", location, link_path, exe_path, target_cli_args);
 
 		std::string file_content;
 		fmt::append(file_content, "[Desktop Entry]\n");
@@ -360,15 +434,8 @@ namespace gui::utils
 			fmt::append(file_content, "Comment=%s\n", QString::fromStdString(description).simplified());
 		}
 
-		if (!src_icon_path.empty() && !target_icon_dir.empty())
+		if (!target_icon_path.empty())
 		{
-			std::string target_icon_path;
-			if (!create_square_shortcut_icon_file(path, src_icon_path, target_icon_dir, target_icon_path, 512))
-			{
-				// Error is logged in create_square_shortcut_icon_file
-				return false;
-			}
-
 			fmt::append(file_content, "Icon=%s\n", target_icon_path);
 		}
 
@@ -396,6 +463,111 @@ namespace gui::utils
 
 		return true;
 #endif
+	}
+
+	bool create_shortcuts(const std::shared_ptr<gui_game_info>& game,
+	                      const std::set<gui::utils::shortcut_location>& locations)
+	{
+		if (!game || locations.empty()) return false;
+
+		std::string gameid_token_value;
+
+		const std::string dev_flash = g_cfg_vfs.get_dev_flash();
+		const bool is_iso = is_file_iso(game->info.path);
+		std::shared_ptr<iso_archive> archive;
+
+		const auto file_exists = [&archive](const std::string& path)
+		{
+			return archive ? archive->is_file(path) : fs::is_file(path);
+		};
+
+		if (is_iso)
+		{
+			gameid_token_value = game->info.serial;
+			archive = std::make_shared<iso_archive>(game->info.path);
+		}
+		else if (game->info.category == "DG" && !fs::is_file(rpcs3::utils::get_hdd0_dir() + "/game/" + game->info.serial + "/USRDIR/EBOOT.BIN"))
+		{
+			const usz ps3_game_dir_pos = fs::get_parent_dir(game->info.path).size();
+			std::string relative_boot_dir = game->info.path.substr(ps3_game_dir_pos);
+
+			if (usz char_pos = relative_boot_dir.find_first_not_of(fs::delim); char_pos != umax)
+			{
+				relative_boot_dir = relative_boot_dir.substr(char_pos);
+			}
+			else
+			{
+				relative_boot_dir.clear();
+			}
+
+			if (!relative_boot_dir.empty())
+			{
+				if (relative_boot_dir != "PS3_GAME")
+				{
+					gameid_token_value = game->info.serial + "/" + relative_boot_dir;
+				}
+				else
+				{
+					gameid_token_value = game->info.serial;
+				}
+			}
+		}
+		else
+		{
+			gameid_token_value = game->info.serial;
+		}
+
+		const std::string target_icon_dir = fmt::format("%sIcons/game_icons/%s/", fs::get_config_dir(), game->info.serial);
+
+		if (!fs::create_path(target_icon_dir))
+		{
+			sys_log.error("Failed to create shortcut path %s (%s)", QString::fromStdString(game->info.name).simplified(), target_icon_dir, fs::g_tls_error);
+			return false;
+		}
+
+		bool success = true;
+		const bool is_vsh = game->info.path.starts_with(dev_flash);
+		const std::string cli_arg_token = is_vsh ? "RPCS3_VFS" : "RPCS3_GAMEID";
+		const std::string cli_arg_value = is_vsh ? ("dev_flash/" + game->info.path.substr(dev_flash.size())) : gameid_token_value;
+
+		for (gui::utils::shortcut_location location : locations)
+		{
+			std::string banner_path;
+
+			if (location == gui::utils::shortcut_location::steam)
+			{
+				// Try to find a nice banner for steam
+				const std::string sfo_dir = is_iso ? "PS3_GAME" : rpcs3::utils::get_sfo_dir_from_game_path(game->info.path);
+
+				for (const std::string& filename : {"PIC1.PNG"s, "PIC3.PNG"s, "PIC0.PNG"s, "PIC2.PNG"s, "ICON0.PNG"s})
+				{
+					if (const std::string filepath = fmt::format("%s/%s", sfo_dir, filename); file_exists(filepath))
+					{
+						banner_path = filepath;
+						break;
+					}
+				}
+			}
+
+#ifdef __linux__
+			const std::string percent = location == gui::utils::shortcut_location::steam ? "%" : "%%";
+#else
+			const std::string percent = "%";
+#endif
+			const std::string target_cli_args = fmt::format("--no-gui \"%s%s%s:%s\"", percent, cli_arg_token, percent, cli_arg_value);
+
+			if (!gameid_token_value.empty() && create_shortcut(game->info.name, game->icon_in_archive ? game->info.path : "", game->info.serial, target_cli_args, game->info.name, game->info.icon_path, target_icon_dir, banner_path, location, archive))
+			{
+				sys_log.success("Created %s shortcut for %s", location, QString::fromStdString(game->info.name).simplified());
+			}
+			else
+			{
+				sys_log.error("Failed to create %s shortcut for %s", location, QString::fromStdString(game->info.name).simplified());
+				success = false;
+			}
+		}
+
+		return success;
 	}
 
 	void remove_shortcuts(const std::string& name, [[maybe_unused]] const std::string& serial)
@@ -438,7 +610,8 @@ namespace gui::utils
 
 		std::vector<shortcut_location> locations = {
 			shortcut_location::desktop,
-			shortcut_location::applications
+			shortcut_location::applications,
+			shortcut_location::steam,
 		};
 #ifdef _WIN32
 		locations.push_back(shortcut_location::rpcs3_shortcuts);
@@ -457,6 +630,19 @@ namespace gui::utils
 				link_path = QStandardPaths::writableLocation(QStandardPaths::StandardLocation::ApplicationsLocation).toStdString();
 				link_path += "/RPCS3";
 				break;
+			case shortcut_location::steam:
+			{
+				const std::string exe_path = fs::get_executable_path();
+				const std::string working_dir = fs::get_executable_dir();
+				steam_shortcut steam_sc{};
+				steam_sc.remove_shortcut(simple_name, exe_path, working_dir);
+				if (!steam_sc.write_file())
+				{
+					sys_log.error("Failed to remove steam shortcut for '%s'", simple_name);
+				}
+
+				continue;
+			}
 #ifdef _WIN32
 			case shortcut_location::rpcs3_shortcuts:
 				link_path = rpcs3::utils::get_games_shortcuts_dir();
